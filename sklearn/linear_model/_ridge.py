@@ -320,6 +320,7 @@ def _solve_lbfgs(
     X_offset=None,
     X_scale=None,
     sample_weight_sqrt=None,
+    epsilon=None,
 ):
     """Solve ridge regression with LBFGS.
 
@@ -327,6 +328,13 @@ def _solve_lbfgs(
     For unconstrained ridge regression, there are faster dedicated solver methods.
     Note that with positive bounds on the coefficients, LBFGS seems faster
     than scipy.optimize.lsq_linear.
+    
+    Parameters
+    ----------
+    epsilon : float, default=None
+        Threshold for Huber loss. If None, uses MSE loss. If provided, uses 
+        Huber loss which is quadratic for |residual| <= epsilon and linear 
+        for |residual| > epsilon.
     """
     n_samples, n_features = X.shape
 
@@ -360,10 +368,35 @@ def _solve_lbfgs(
             residual = X.dot(w) - y_column
             if X_offset_scale is not None:
                 residual -= sample_weight_sqrt * w.dot(X_offset_scale)
-            f = 0.5 * residual.dot(residual) + 0.5 * alpha[i] * w.dot(w)
-            grad = X.T @ residual + alpha[i] * w
-            if X_offset_scale is not None:
-                grad -= X_offset_scale * residual.dot(sample_weight_sqrt)
+            
+            if epsilon is None:
+                # Standard MSE loss
+                f = 0.5 * residual.dot(residual) + 0.5 * alpha[i] * w.dot(w)
+                grad = X.T @ residual + alpha[i] * w
+                if X_offset_scale is not None:
+                    grad -= X_offset_scale * residual.dot(sample_weight_sqrt)
+            else:
+                # Huber loss
+                abs_residual = np.abs(residual)
+                # Quadratic part: |r| <= epsilon
+                quadratic_mask = abs_residual <= epsilon
+                # Linear part: |r| > epsilon
+                linear_mask = ~quadratic_mask
+                
+                # Loss: 0.5 * r^2 for |r| <= epsilon
+                #       epsilon * (|r| - 0.5 * epsilon) for |r| > epsilon
+                f = 0.5 * np.sum(residual[quadratic_mask]**2)
+                f += epsilon * np.sum(abs_residual[linear_mask] - 0.5 * epsilon)
+                f += 0.5 * alpha[i] * w.dot(w)
+                
+                # Gradient: r for |r| <= epsilon
+                #           epsilon * sign(r) for |r| > epsilon
+                grad_residual = np.zeros_like(residual)
+                grad_residual[quadratic_mask] = residual[quadratic_mask]
+                grad_residual[linear_mask] = epsilon * np.sign(residual[linear_mask])
+                grad = X.T @ grad_residual + alpha[i] * w
+                if X_offset_scale is not None:
+                    grad -= X_offset_scale * grad_residual.dot(sample_weight_sqrt)
 
             return f, grad
 
@@ -628,6 +661,7 @@ def _ridge_regression(
     X_offset=None,
     check_input=True,
     fit_intercept=False,
+    epsilon=None,
 ):
     xp, is_array_api_compliant, device_ = get_namespace_and_device(
         X, y, sample_weight, X_scale, X_offset
@@ -815,6 +849,7 @@ def _ridge_regression(
             X_offset=X_offset,
             X_scale=X_scale,
             sample_weight_sqrt=sample_weight_sqrt if has_sw else None,
+            epsilon=epsilon,
         )
 
     if solver == "svd":
@@ -899,6 +934,7 @@ class _BaseRidge(LinearModel, metaclass=ABCMeta):
         ],
         "positive": ["boolean"],
         "random_state": ["random_state"],
+        "epsilon": [Interval(Real, 0, None, closed="neither"), None],
     }
 
     @abstractmethod
@@ -913,6 +949,7 @@ class _BaseRidge(LinearModel, metaclass=ABCMeta):
         solver="auto",
         positive=False,
         random_state=None,
+        epsilon=None,
     ):
         self.alpha = alpha
         self.fit_intercept = fit_intercept
@@ -922,17 +959,25 @@ class _BaseRidge(LinearModel, metaclass=ABCMeta):
         self.solver = solver
         self.positive = positive
         self.random_state = random_state
+        self.epsilon = epsilon
 
     def fit(self, X, y, sample_weight=None):
         xp, is_array_api_compliant = get_namespace(X, y, sample_weight)
 
-        if self.solver == "lbfgs" and not self.positive:
+        # Force LBFGS solver when using Huber loss
+        if self.epsilon is not None:
+            if self.solver not in ["auto", "lbfgs"]:
+                raise ValueError(
+                    "When epsilon is provided (Huber loss), only 'lbfgs' solver is supported. "
+                    f"Please set solver to 'auto' or 'lbfgs', got '{self.solver}'."
+                )
+            solver = "lbfgs"
+        elif self.solver == "lbfgs" and not self.positive:
             raise ValueError(
-                "'lbfgs' solver can be used only when positive=True. "
+                "'lbfgs' solver can be used only when positive=True or when epsilon is provided. "
                 "Please use another solver."
             )
-
-        if self.positive:
+        elif self.positive:
             if self.solver not in ["auto", "lbfgs"]:
                 raise ValueError(
                     f"solver='{self.solver}' does not support positive fitting. Please"
@@ -992,6 +1037,7 @@ class _BaseRidge(LinearModel, metaclass=ABCMeta):
                 return_intercept=True,
                 return_solver=True,
                 check_input=False,
+                epsilon=self.epsilon,
             )
             # add the offset which was subtracted by _preprocess_data
             self.intercept_ += y_offset
@@ -1019,6 +1065,7 @@ class _BaseRidge(LinearModel, metaclass=ABCMeta):
                 return_solver=True,
                 check_input=False,
                 fit_intercept=self.fit_intercept,
+                epsilon=self.epsilon,
                 **params,
             )
             self._set_intercept(X_offset, y_offset, X_scale)
@@ -1031,10 +1078,17 @@ class Ridge(MultiOutputMixin, RegressorMixin, _BaseRidge):
 
     Minimizes the objective function::
 
-    ||y - Xw||^2_2 + alpha * ||w||^2_2
+    loss(y, Xw) + alpha * ||w||^2_2
+
+    Where loss can be either MSE (default) or Huber loss (when epsilon is provided).
+
+    - MSE loss: ||y - Xw||^2_2
+    - Huber loss: sum_i huber(y_i - (Xw)_i, epsilon)
+      where huber(r, epsilon) = 0.5 * r^2 if |r| <= epsilon,
+                                epsilon * (|r| - 0.5 * epsilon) otherwise
 
     This model solves a regression model where the loss function is
-    the linear least squares function and regularization is given by
+    the linear least squares function (or Huber loss) and regularization is given by
     the l2-norm. Also known as Ridge Regression or Tikhonov regularization.
     This estimator has built-in support for multi-variate regression
     (i.e., when y is a 2d-array of shape (n_samples, n_targets)).
@@ -1123,8 +1177,8 @@ class Ridge(MultiOutputMixin, RegressorMixin, _BaseRidge):
           scaler from :mod:`sklearn.preprocessing`.
 
         - 'lbfgs' uses L-BFGS-B algorithm implemented in
-          :func:`scipy.optimize.minimize`. It can be used only when `positive`
-          is True.
+          :func:`scipy.optimize.minimize`. It can be used when `positive`
+          is True or when `epsilon` is provided (Huber loss).
 
         All solvers except 'svd' support both dense and sparse data. However, only
         'lsqr', 'sag', 'sparse_cg', and 'lbfgs' support sparse input when
@@ -1145,6 +1199,13 @@ class Ridge(MultiOutputMixin, RegressorMixin, _BaseRidge):
 
         .. versionadded:: 0.17
            `random_state` to support Stochastic Average Gradient.
+
+    epsilon : float, default=None
+        Threshold for Huber loss. If None (default), uses standard MSE loss.
+        If provided, uses Huber loss which is less sensitive to outliers.
+        The loss is quadratic for |residual| <= epsilon and linear for
+        |residual| > epsilon. Must be strictly positive. Only 'lbfgs' solver
+        is supported when epsilon is provided.
 
     Attributes
     ----------
@@ -1217,6 +1278,7 @@ class Ridge(MultiOutputMixin, RegressorMixin, _BaseRidge):
         solver="auto",
         positive=False,
         random_state=None,
+        epsilon=None,
     ):
         super().__init__(
             alpha=alpha,
@@ -1227,6 +1289,7 @@ class Ridge(MultiOutputMixin, RegressorMixin, _BaseRidge):
             solver=solver,
             positive=positive,
             random_state=random_state,
+            epsilon=epsilon,
         )
 
     @_fit_context(prefer_skip_nested_validation=True)
