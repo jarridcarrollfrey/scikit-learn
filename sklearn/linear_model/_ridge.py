@@ -53,7 +53,9 @@ from sklearn.utils._array_api import (
 )
 from sklearn.utils._param_validation import Interval, StrOptions, validate_params
 from sklearn.utils.extmath import row_norms, safe_sparse_dot
-from sklearn.utils.fixes import _sparse_linalg_cg
+from sklearn.utils.fixes import _get_additional_lbfgs_options_dict, _sparse_linalg_cg
+from sklearn.utils.optimize import _check_optimize_result
+from sklearn.utils._mask import axis0_safe_slice
 from sklearn.utils.metadata_routing import (
     MetadataRouter,
     MethodMapping,
@@ -67,6 +69,103 @@ from sklearn.utils.validation import (
     check_is_fitted,
     validate_data,
 )
+
+
+def _ridge_huber_loss_and_gradient(w, X, y, epsilon, alpha, sample_weight=None, fit_intercept=True):
+    """Returns the Huber loss and gradient for Ridge regression.
+
+    Parameters
+    ----------
+    w : ndarray, shape (n_features,) or (n_features + 1,)
+        Feature vector.
+        w[:n_features] gives the coefficients
+        w[-1] gives the intercept if fit_intercept=True.
+
+    X : ndarray of shape (n_samples, n_features)
+        Input data.
+
+    y : ndarray of shape (n_samples,)
+        Target vector.
+
+    epsilon : float
+        Robustness parameter for Huber loss. Samples with residual > epsilon
+        use linear loss instead of quadratic.
+
+    alpha : float
+        L2 regularization parameter.
+
+    sample_weight : ndarray of shape (n_samples,), default=None
+        Weight assigned to each sample.
+
+    fit_intercept : bool, default=True
+        Whether intercept is being fit.
+
+    Returns
+    -------
+    loss : float
+        Huber loss + L2 regularization.
+
+    gradient : ndarray, shape (len(w))
+        Gradient of the loss with respect to coefficients and intercept.
+    """
+    n_features = X.shape[1]
+    if fit_intercept:
+        intercept = w[-1]
+        coef = w[:-1]
+    else:
+        intercept = 0.0
+        coef = w
+
+    # Compute residuals
+    linear_loss = y - safe_sparse_dot(X, coef) - intercept
+    abs_linear_loss = np.abs(linear_loss)
+
+    # Identify outliers (samples with |residual| > epsilon)
+    outliers_mask = abs_linear_loss > epsilon
+
+    # Compute Huber loss
+    # For |residual| <= epsilon: loss = 0.5 * residual^2
+    # For |residual| > epsilon: loss = epsilon * |residual| - 0.5 * epsilon^2
+    if sample_weight is None:
+        sample_weight = np.ones(X.shape[0])
+
+    # Quadratic part (non-outliers)
+    non_outliers = linear_loss[~outliers_mask]
+    weighted_non_outliers = sample_weight[~outliers_mask] * non_outliers
+    squared_loss = 0.5 * np.dot(weighted_non_outliers, non_outliers)
+
+    # Linear part (outliers)
+    outliers = abs_linear_loss[outliers_mask]
+    outliers_sw = sample_weight[outliers_mask]
+    linear_loss_outliers = epsilon * np.sum(outliers_sw * outliers) - 0.5 * epsilon**2 * np.sum(outliers_sw)
+
+    # Total loss
+    loss = squared_loss + linear_loss_outliers + alpha * np.dot(coef, coef)
+
+    # Compute gradient
+    if fit_intercept:
+        grad = np.zeros(n_features + 1)
+    else:
+        grad = np.zeros(n_features)
+
+    # Gradient for coefficients: quadratic part
+    n_non_outliers = np.sum(~outliers_mask)
+    X_non_outliers = axis0_safe_slice(X, ~outliers_mask, n_non_outliers)
+    grad_coef_quad = -safe_sparse_dot(weighted_non_outliers, X_non_outliers)
+
+    # Gradient for coefficients: linear part
+    signed_outliers = np.sign(linear_loss[outliers_mask])
+    X_outliers = axis0_safe_slice(X, outliers_mask, np.sum(outliers_mask))
+    sw_outliers = sample_weight[outliers_mask] * signed_outliers
+    grad_coef_linear = -epsilon * safe_sparse_dot(sw_outliers, X_outliers)
+
+    grad[:n_features] = grad_coef_quad + grad_coef_linear + 2.0 * alpha * coef
+
+    # Gradient for intercept
+    if fit_intercept:
+        grad[-1] = -np.sum(weighted_non_outliers) - epsilon * np.sum(sw_outliers)
+
+    return loss, grad
 
 
 def _get_rescaled_operator(X, X_offset, sample_weight_sqrt):
@@ -1027,15 +1126,19 @@ class _BaseRidge(LinearModel, metaclass=ABCMeta):
 
 
 class Ridge(MultiOutputMixin, RegressorMixin, _BaseRidge):
-    """Linear least squares with l2 regularization.
+    """Linear regression with Huber loss and l2 regularization.
 
     Minimizes the objective function::
 
-    ||y - Xw||^2_2 + alpha * ||w||^2_2
+    Huber_loss(y - Xw) + alpha * ||w||^2_2
+
+    where Huber_loss is defined as:
+    - For |residual| <= epsilon: 0.5 * residual^2
+    - For |residual| > epsilon: epsilon * |residual| - 0.5 * epsilon^2
 
     This model solves a regression model where the loss function is
-    the linear least squares function and regularization is given by
-    the l2-norm. Also known as Ridge Regression or Tikhonov regularization.
+    the Huber loss function (robust to outliers) and regularization is given by
+    the l2-norm. Also known as Ridge Regression with Huber loss.
     This estimator has built-in support for multi-variate regression
     (i.e., when y is a 2d-array of shape (n_samples, n_targets)).
 
@@ -1054,6 +1157,12 @@ class Ridge(MultiOutputMixin, RegressorMixin, _BaseRidge):
 
         If an array is passed, penalties are assumed to be specific to the
         targets. Hence they must correspond in number.
+
+    epsilon : float, default=1.35
+        The parameter epsilon controls the threshold for Huber loss.
+        Samples with |residual| <= epsilon use quadratic loss,
+        while samples with |residual| > epsilon use linear loss.
+        Smaller epsilon values make the model more robust to outliers.
 
     fit_intercept : bool, default=True
         Whether to fit the intercept for this model. If set
@@ -1187,6 +1296,11 @@ class Ridge(MultiOutputMixin, RegressorMixin, _BaseRidge):
 
     Notes
     -----
+    This implementation uses Huber loss instead of mean squared error (MSE),
+    making it robust to outliers while maintaining L2 regularization.
+    The Huber loss transitions from quadratic (for small residuals) to linear
+    (for large residuals) at the threshold defined by epsilon.
+    
     Regularization improves the conditioning of the problem and
     reduces the variance of the estimates. Larger values specify stronger
     regularization. Alpha corresponds to ``1 / (2C)`` in other linear
@@ -1210,6 +1324,7 @@ class Ridge(MultiOutputMixin, RegressorMixin, _BaseRidge):
         self,
         alpha=1.0,
         *,
+        epsilon=1.35,
         fit_intercept=True,
         copy_X=True,
         max_iter=None,
@@ -1228,6 +1343,7 @@ class Ridge(MultiOutputMixin, RegressorMixin, _BaseRidge):
             positive=positive,
             random_state=random_state,
         )
+        self.epsilon = epsilon
 
     @_fit_context(prefer_skip_nested_validation=True)
     def fit(self, X, y, sample_weight=None):
@@ -1262,7 +1378,100 @@ class Ridge(MultiOutputMixin, RegressorMixin, _BaseRidge):
             multi_output=True,
             y_numeric=True,
         )
-        return super().fit(X, y, sample_weight=sample_weight)
+
+        # Always use Huber loss (epsilon has a default value)
+        return self._fit_huber(X, y, sample_weight=sample_weight)
+
+    def _fit_huber(self, X, y, sample_weight=None):
+        """Fit Ridge regression using Huber loss with L-BFGS-B optimization."""
+        xp, _ = get_namespace(X, y, sample_weight)
+
+        # Handle multi-output case
+        if y.ndim == 1:
+            y = y.reshape(-1, 1)
+        n_targets = y.shape[1]
+
+        # Convert to numpy for optimization
+        # Convert sparse matrices to dense for L-BFGS-B optimization
+        if sparse.issparse(X):
+            X = X.toarray()
+        if not _is_numpy_namespace(xp):
+            X = _convert_to_numpy(X)
+            y = _convert_to_numpy(y)
+
+        sample_weight = _check_sample_weight(sample_weight, X, dtype=X.dtype)
+
+        # Fit each target separately
+        coefs = []
+        intercepts = []
+        n_iters = []
+
+        for target_idx in range(n_targets):
+            y_target = y[:, target_idx]
+
+            # Initialize parameters
+            if self.fit_intercept:
+                parameters = np.zeros(X.shape[1] + 1)
+            else:
+                parameters = np.zeros(X.shape[1])
+
+            # Use L-BFGS-B for optimization
+            max_iter = self.max_iter if self.max_iter is not None else 15000
+
+            # Get alpha for this target (handle array case)
+            if isinstance(self.alpha, np.ndarray) and self.alpha.ndim > 0:
+                alpha_target = self.alpha[target_idx]
+            else:
+                alpha_target = self.alpha
+
+            # Create loss function wrapper
+            def loss_and_grad(w):
+                return _ridge_huber_loss_and_gradient(
+                    w, X, y_target, self.epsilon, alpha_target,
+                    sample_weight=sample_weight,
+                    fit_intercept=self.fit_intercept
+                )
+
+            opt_res = optimize.minimize(
+                loss_and_grad,
+                parameters,
+                method="L-BFGS-B",
+                jac=True,
+                options={
+                    "maxiter": max_iter,
+                    "gtol": self.tol,
+                    **_get_additional_lbfgs_options_dict("iprint", -1),
+                },
+            )
+
+            if opt_res.status == 2:
+                raise ValueError(
+                    f"Ridge convergence failed: L-BFGS-B solver terminated with {opt_res.message}"
+                )
+
+            n_iter = _check_optimize_result("lbfgs", opt_res, max_iter)
+            n_iters.append(n_iter)
+
+            # Extract coefficients and intercept
+            if self.fit_intercept:
+                coefs.append(opt_res.x[:-1])
+                intercepts.append(opt_res.x[-1])
+            else:
+                coefs.append(opt_res.x)
+                intercepts.append(0.0)
+
+        # Set attributes
+        if n_targets == 1:
+            self.coef_ = coefs[0]
+            self.intercept_ = intercepts[0]
+            self.n_iter_ = n_iters[0]
+        else:
+            self.coef_ = np.array(coefs)
+            self.intercept_ = np.array(intercepts)
+            self.n_iter_ = np.array(n_iters)
+
+        self.solver_ = "lbfgs"
+        return self
 
     def __sklearn_tags__(self):
         tags = super().__sklearn_tags__()
