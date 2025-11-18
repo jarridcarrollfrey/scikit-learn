@@ -86,6 +86,7 @@ _submodules = [
     "feature_selection",
     "frozen",
     "gaussian_process",
+    "graph",
     "inspection",
     "isotonic",
     "kernel_approximation",
